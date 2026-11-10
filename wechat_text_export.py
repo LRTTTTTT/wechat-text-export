@@ -25,7 +25,7 @@ import win32security
 
 SOURCE_HOME = Path(__file__).resolve().parent
 HERE = Path(getattr(sys, "_MEIPASS", SOURCE_HOME))
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 VENDOR_DB = HERE / "vendor" / "wechatauto" / "db.py"
 VENDOR_SHA256 = "c39b12ad20db284db125f045e398b58b11d2901a52bad857178b44c00a5c0155"
 if hashlib.sha256(VENDOR_DB.read_bytes()).hexdigest() != VENDOR_SHA256:
