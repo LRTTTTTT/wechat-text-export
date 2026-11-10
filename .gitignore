@@ -1,0 +1,14 @@
+.venv/
+.deps/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+build/
+dist/
+release/
+*.dpapi
+*.sqlite
+*.sqlite-*
+txt_chat/
+probe_task.json

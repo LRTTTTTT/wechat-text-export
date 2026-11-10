@@ -1,0 +1,4 @@
+cryptography==50.0.2
+pywin32==312
+psutil==7.2.2
+zstandard==0.25.0
