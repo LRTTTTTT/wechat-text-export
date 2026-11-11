@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -25,7 +26,7 @@ import win32security
 
 SOURCE_HOME = Path(__file__).resolve().parent
 HERE = Path(getattr(sys, "_MEIPASS", SOURCE_HOME))
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 VENDOR_DB = HERE / "vendor" / "wechatauto" / "db.py"
 VENDOR_SHA256 = "c39b12ad20db284db125f045e398b58b11d2901a52bad857178b44c00a5c0155"
 if hashlib.sha256(VENDOR_DB.read_bytes()).hexdigest() != VENDOR_SHA256:
@@ -43,7 +44,8 @@ OUTPUT_ROOT: Path | None = None
 STATE_ROOT: Path | None = None
 POLL_SECONDS = 5
 HEARTBEAT_SECONDS = 120
-RETRY_SECONDS = 60
+SYNC_SECONDS = 300
+RESUME_GAP_SECONDS = 30
 
 
 class _NullWriter:
@@ -413,12 +415,14 @@ class Archive:
 def _temp_dir(account: str) -> Path:
     base = LOCAL_ROOT / "tmp"
     base.mkdir(parents=True, exist_ok=True)
+    if _is_reparse_point(base):
+        raise RuntimeError("Application temp root is a link")
     return base / account
 
 
 def _cleanup_temp(path: Path) -> None:
     base = LOCAL_ROOT / "tmp"
-    if path.parent != base or path.is_symlink():
+    if path.parent != base or _is_reparse_point(base) or _is_reparse_point(path):
         raise RuntimeError("Refusing to remove a path outside the app temp directory")
     if not path.exists():
         return
@@ -430,12 +434,34 @@ def _cleanup_temp(path: Path) -> None:
     path.rmdir()
 
 
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        return bool(path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except FileNotFoundError:
+        return False
+
+
+def cleanup_stale_temp() -> None:
+    """Remove only flat snapshots inside our own cache after an interrupted run."""
+    base = LOCAL_ROOT / "tmp"
+    if _is_reparse_point(base):
+        raise RuntimeError("Application temp root is a link")
+    if not base.exists():
+        return
+    for path in base.iterdir():
+        if not path.is_dir() or _is_reparse_point(path):
+            raise RuntimeError("Unexpected entry in application temp root")
+        _cleanup_temp(path)
+
+
 def export_account(account: str) -> dict[str, int]:
     assert DATA_ROOT is not None and OUTPUT_ROOT is not None and STATE_ROOT is not None
     secure_output_directory(OUTPUT_ROOT)
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
     os.environ["WECHATAUTO_KEYS_DIR"] = str(STATE_ROOT / "keys")
     workdir = _temp_dir(account)
+    if workdir.exists():
+        _cleanup_temp(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     archive = None
     conns = []
@@ -566,99 +592,136 @@ def maybe_update() -> bool:
 
 
 class LoginTracker:
-    """One export per observed account login, including same-process relogin."""
+    """Immediate login export followed by one sequential scan every five minutes."""
 
     def __init__(self):
-        self.active: dict[str, tuple[int, int]] = {}
-        self.completed: set[tuple[str, tuple[int, int]]] = set()
+        self.active: dict[str, tuple[tuple[int, int], tuple]] = {}
+        self.next_due: dict[str, float] = {}
 
-    def observe(self, live: set[str], markers: dict[str, tuple[int, int]]) -> list[str]:
+    def observe(self, live: set[str], markers: dict[str, tuple[int, int]],
+                signature: tuple, now: float) -> list[str]:
         for account in set(self.active) - live:
             self.active.pop(account, None)
+            self.next_due.pop(account, None)
         due = []
         for account in sorted(live):
-            token = markers.get(account, (0, 0))
+            token = (markers.get(account, (0, 0)), signature)
             if self.active.get(account) != token:
                 self.active[account] = token
-                self.completed.discard((account, token))
-            if (account, token) not in self.completed:
+                self.next_due[account] = 0.0
+            if now >= self.next_due[account]:
                 due.append(account)
         return due
 
-    def mark_done(self, account: str) -> None:
-        self.completed.add((account, self.active[account]))
+    def mark_attempt(self, account: str, started: float) -> None:
+        self.next_due[account] = started + SYNC_SECONDS
+
+    def has_due(self, now: float) -> bool:
+        return any(now >= due for due in self.next_due.values())
+
+    def force_due(self) -> None:
+        for account in self.next_due:
+            self.next_due[account] = 0.0
+
+
+class ErrorReporter:
+    """At most one log entry for each error in an uninterrupted failure episode."""
+
+    def __init__(self):
+        self.seen: dict[str, set[tuple[str, str]]] = {}
+
+    def report(self, scope: str, event: str, error: str) -> None:
+        key = (event, error)
+        seen = self.seen.setdefault(scope, set())
+        if key not in seen:
+            fields = {"error": error}
+            if scope not in ("watch", "temp"):
+                fields["account"] = scope
+            try:
+                log(event, **fields)
+                seen.add(key)
+            except OSError:
+                pass  # A log write failure must not stop the silent watcher.
+
+    def recovered(self, scope: str) -> None:
+        self.seen.pop(scope, None)
+
+
+class WatchState:
+    def __init__(self, errors: ErrorReporter):
+        self.errors = errors
+        self.last_signature: tuple = ()
+        self.last_markers: dict[str, tuple[int, int]] = {}
+        self.last_probe = 0.0
+        self.tracker = LoginTracker()
+        self.update_checked: set[tuple[str, tuple]] = set()
+        self.current_root: Path | None = None
+
+    def step(self, now: float, resumed: bool = False) -> bool:
+        root = refresh_data_root()
+        if root != self.current_root:
+            self.current_root = root
+            self.last_markers = {}
+            self.tracker = LoginTracker()
+            self.update_checked.clear()
+        signature = process_signature()
+        markers = {p.name: login_marker(p.name) for p in account_dirs()}
+        if resumed:
+            self.tracker.force_due()
+        changed = signature != self.last_signature or markers != self.last_markers
+        if not (changed or resumed or self.tracker.has_due(now)
+                or now - self.last_probe >= HEARTBEAT_SECONDS):
+            return False
+        self.last_signature, self.last_markers, self.last_probe = signature, markers, now
+        live = set(live_accounts()) if signature and root is not None else set()
+        for account in set(self.tracker.active) - live:
+            self.errors.recovered(account)
+            self.update_checked = {item for item in self.update_checked if item[0] != account}
+        for account in self.tracker.observe(live, markers, signature, now):
+            token = self.tracker.active[account]
+            self.tracker.mark_attempt(account, time.monotonic())
+            should_check_update = (account, token) not in self.update_checked
+            if should_check_update:
+                self.update_checked.add((account, token))
+            if not version_supported():
+                self.errors.report(account, "unsupported_weixin_version", "UnsupportedVersion")
+                if should_check_update and maybe_update():
+                    return True
+                continue
+            try:
+                export_account(account)
+                self.errors.recovered(account)
+                if should_check_update and maybe_update():
+                    return True
+            except Exception as exc:
+                self.errors.report(account, "export_failed", type(exc).__name__)
+                if should_check_update and maybe_update():
+                    return True
+        return False
 
 
 def watch() -> None:
-    write_status()
-    log("watch_started")
-    last_signature = ()
-    last_markers = {}
-    last_probe = 0.0
-    tracker = LoginTracker()
-    retry: dict[str, float] = {}
-    failures: dict[str, int] = {}
-    blocked: set[tuple[str, tuple[int, int]]] = set()
-    update_checked: set[tuple[str, tuple[int, int]]] = set()
-    current_root = None
+    errors = ErrorReporter()
+    state = WatchState(errors)
     while True:
         try:
-            root = refresh_data_root()
-            if root != current_root:
-                current_root = root
-                last_markers = {}
-                tracker = LoginTracker()
-                retry.clear()
-                failures.clear()
-                blocked.clear()
-                update_checked.clear()
-            signature = process_signature()
-            markers = {p.name: login_marker(p.name) for p in account_dirs()}
-            now = time.monotonic()
-            changed = signature != last_signature or markers != last_markers
-            due_retry = any(t <= now for t in retry.values())
-            if changed or due_retry or now - last_probe >= HEARTBEAT_SECONDS:
-                last_signature, last_markers, last_probe = signature, markers, now
-                live = set(live_accounts()) if signature else set()
-                for account in set(tracker.active) - live:
-                    retry.pop(account, None)
-                    failures.pop(account, None)
-                    update_checked = {item for item in update_checked if item[0] != account}
-                for account in tracker.observe(live, markers):
-                    token = tracker.active[account]
-                    if (account, token) in blocked:
-                        continue
-                    if retry.get(account, 0) > now:
-                        continue
-                    should_check_update = (account, token) not in update_checked
-                    if should_check_update:
-                        update_checked.add((account, token))
-                    if not version_supported():
-                        log("unsupported_weixin_version")
-                        blocked.add((account, token))
-                        if should_check_update and maybe_update():
-                            return
-                        continue
-                    try:
-                        stats = export_account(account)
-                        tracker.mark_done(account)
-                        retry.pop(account, None)
-                        failures.pop(account, None)
-                        log("export_ok", account=account, **stats)
-                        if should_check_update and maybe_update():
-                            return
-                    except Exception as exc:
-                        failures[account] = failures.get(account, 0) + 1
-                        log("export_failed", account=account, error=type(exc).__name__)
-                        if should_check_update and maybe_update():
-                            return
-                        if failures[account] >= 3:
-                            blocked.add((account, token))
-                            log("export_disabled", account=account)
-                        else:
-                            retry[account] = now + RETRY_SECONDS
+            cleanup_stale_temp()
+            errors.recovered("temp")
+            break
         except Exception as exc:
-            log("watch_error", error=type(exc).__name__)
+            errors.report("temp", "temp_cleanup_failed", type(exc).__name__)
+            time.sleep(SYNC_SECONDS)
+    write_status()
+    last_sleep_wall = time.time()
+    while True:
+        try:
+            resumed = time.time() - last_sleep_wall > RESUME_GAP_SECONDS
+            if state.step(time.monotonic(), resumed):
+                return
+            errors.recovered("watch")
+        except Exception as exc:
+            errors.report("watch", "watch_error", type(exc).__name__)
+        last_sleep_wall = time.time()
         time.sleep(POLL_SECONDS)
 
 
